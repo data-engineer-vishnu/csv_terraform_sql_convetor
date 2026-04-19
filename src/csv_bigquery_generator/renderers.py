@@ -9,21 +9,29 @@ from .models import Table
 
 def write_outputs(tables: list[Table], output_root: Path) -> None:
     terraform_root = output_root / "terraform"
+    sql_root = output_root / "sql"
     terraform_root.mkdir(parents=True, exist_ok=True)
+    sql_root.mkdir(parents=True, exist_ok=True)
+    clear_generated_layer_files(terraform_root)
+    clear_generated_layer_files(sql_root)
     write_terraform_shared_files(terraform_root)
     table_index = build_table_index(tables)
+    tables_by_layer = group_tables_by_layer(tables)
+
+    for layer, layer_tables in tables_by_layer.items():
+        terraform_dir = terraform_root / layer
+        terraform_dir.mkdir(parents=True, exist_ok=True)
+        terraform_content = "\n".join(
+            render_terraform(table, table_index).rstrip() for table in layer_tables
+        )
+        (terraform_dir / f"{layer}.tf").write_text(f"{terraform_content}\n", encoding="utf-8")
 
     for table in tables:
-        terraform_dir = terraform_root / table.layer
         sql_dir = output_root / "sql" / table.layer
-        terraform_dir.mkdir(parents=True, exist_ok=True)
+        sql_dir = output_root / "sql" / table.layer
         sql_dir.mkdir(parents=True, exist_ok=True)
 
         stem = f"{sanitize_name(table.dataset_name)}__{sanitize_name(table.table_name)}"
-        (terraform_dir / f"{stem}.tf").write_text(
-            render_terraform(table, table_index),
-            encoding="utf-8",
-        )
         (sql_dir / f"{stem}.sql").write_text(render_sql(table), encoding="utf-8")
 
 
@@ -32,9 +40,15 @@ def render_terraform(table: Table, table_index: dict[tuple[str, str], Table] | N
     for column in table.columns:
         schema_object = {
             "name": column.name,
-            "type": column.data_type,
+            "type": column.data_type.upper(),
             "mode": "REQUIRED" if column.required else "NULLABLE",
         }
+        if column.character_maximum_length is not None:
+            schema_object["maxLength"] = str(column.character_maximum_length)
+        if column.numeric_precision is not None:
+            schema_object["precision"] = str(column.numeric_precision)
+        if column.numeric_scale is not None:
+            schema_object["scale"] = str(column.numeric_scale)
         if column.default_value:
             schema_object["defaultValueExpression"] = column.default_value
         schema_objects.append(schema_object)
@@ -55,12 +69,12 @@ def render_terraform(table: Table, table_index: dict[tuple[str, str], Table] | N
         clustering_block = f"  clustering = [{columns}]\n\n"
 
     resource_name = sanitize_name(f"table_{table.dataset_name}_{table.table_name}")
-    dataset_resource_name = sanitize_name(f"dataset_{table.dataset_name}")
     return (
         f"resource \"google_bigquery_table\" \"{resource_name}\" {{\n"
         "  project    = var.project_id\n"
-        f"  dataset_id = google_bigquery_dataset.{dataset_resource_name}.dataset_id\n"
-        f"  table_id   = \"{table.table_name}\"\n\n"
+        f"  dataset_id = \"{table.dataset_name}\"\n"
+        f"  table_id   = \"{table.table_name}\"\n"
+        "  deletion_protection = false\n\n"
         f"{depends_on_block}"
         f"{partition_block}"
         f"{clustering_block}"
@@ -73,7 +87,7 @@ def render_terraform(table: Table, table_index: dict[tuple[str, str], Table] | N
 
 
 def render_terraform_constraints(table: Table) -> str:
-    if not table.primary_key_columns and not table.foreign_key_columns:
+    if not table.primary_key_columns and not table.foreign_keys:
         return ""
 
     lines = ["", "  table_constraints {"]
@@ -86,24 +100,33 @@ def render_terraform_constraints(table: Table) -> str:
                 "    }",
             ]
         )
-    for index, column in enumerate(table.foreign_key_columns, start=1):
-        reference = parse_reference(column.foreign_key)
+    for index, (foreign_key_name, columns) in enumerate(table.foreign_keys, start=1):
+        reference = columns[0].foreign_key_reference
+        if reference is None:
+            continue
         lines.extend(
             [
                 f"    foreign_keys {{",
-                f"      name = \"fk_{sanitize_name(table.table_name)}_{index}\"",
+                f"      name = \"{foreign_key_name or f'fk_{sanitize_name(table.table_name)}_{index}'}\"",
                 "      referenced_table {",
                 "        project_id = var.project_id",
-                f"        dataset_id = \"{reference['dataset']}\"",
-                f"        table_id   = \"{reference['table']}\"",
+                f"        dataset_id = \"{reference.referenced_schema}\"",
+                f"        table_id   = \"{reference.referenced_table}\"",
                 "      }",
-                "      column_references {",
-                f"        referencing_column = \"{column.name}\"",
-                f"        referenced_column  = \"{reference['column']}\"",
-                "      }",
-                "    }",
             ]
         )
+        for column in columns:
+            if column.foreign_key_reference is None:
+                continue
+            lines.extend(
+                [
+                    "      column_references {",
+                    f"        referencing_column = \"{column.name}\"",
+                    f"        referenced_column  = \"{column.foreign_key_reference.referenced_column}\"",
+                    "      }",
+                ]
+            )
+        lines.append("    }")
     lines.append("  }")
     lines.append("")
     return "\n".join(lines)
@@ -113,13 +136,15 @@ def render_terraform_dependencies(
     table: Table, table_index: dict[tuple[str, str], Table]
 ) -> str:
     dependencies: list[str] = []
-    for column in table.foreign_key_columns:
-        reference = parse_reference(column.foreign_key)
-        key = (reference["dataset"], reference["table"])
+    for _, columns in table.foreign_keys:
+        reference = columns[0].foreign_key_reference
+        if reference is None:
+            continue
+        key = (reference.referenced_schema, reference.referenced_table)
         if key not in table_index:
             continue
         dependency_resource = sanitize_name(
-            f"table_{reference['dataset']}_{reference['table']}"
+            f"table_{reference.referenced_schema}_{reference.referenced_table}"
         )
         dependency = f"google_bigquery_table.{dependency_resource}"
         if dependency not in dependencies:
@@ -135,7 +160,7 @@ def render_terraform_dependencies(
 def render_sql(table: Table) -> str:
     column_lines = []
     for column in table.columns:
-        line = f"  {column.name} {column.data_type}"
+        line = f"  {column.name} {column.type_declaration}"
         if column.required:
             line += " NOT NULL"
         if column.default_value:
@@ -146,9 +171,26 @@ def render_sql(table: Table) -> str:
     if table.primary_key_columns:
         pk_names = ", ".join(column.name for column in table.primary_key_columns)
         constraint_lines.append(f"  PRIMARY KEY ({pk_names}) NOT ENFORCED")
-    for column in table.foreign_key_columns:
+    for _, columns in table.foreign_keys:
+        referencing_columns = ", ".join(column.name for column in columns)
+        reference = columns[0].foreign_key_reference
+        if reference is None:
+            continue
+        referenced_columns = ", ".join(
+            column.foreign_key_reference.referenced_column
+            for column in columns
+            if column.foreign_key_reference is not None
+        )
+        constraint_name = (
+            f"CONSTRAINT {columns[0].foreign_key_name} "
+            if columns[0].foreign_key_name
+            else ""
+        )
         constraint_lines.append(
-            f"  FOREIGN KEY ({column.name}) REFERENCES {format_sql_reference(column.foreign_key)} NOT ENFORCED"
+            "  "
+            f"{constraint_name}FOREIGN KEY ({referencing_columns}) "
+            f"REFERENCES {reference.referenced_schema}.{reference.referenced_table}"
+            f"({referenced_columns}) NOT ENFORCED"
         )
 
     body = ",\n".join(column_lines + constraint_lines)
@@ -176,37 +218,6 @@ def sanitize_name(value: str) -> str:
     return normalized.strip("_").lower()
 
 
-def format_sql_reference(reference: str | None) -> str:
-    if not reference:
-        return ""
-    parsed = parse_reference(reference)
-    if parsed["column"]:
-        return f"{parsed['dataset']}.{parsed['table']}({parsed['column']})"
-    return f"{parsed['dataset']}.{parsed['table']}"
-
-
-def extract_foreign_column(reference: str | None) -> str:
-    if not reference:
-        return ""
-    match = re.search(r"\(([^)]+)\)", reference)
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
-def parse_reference(reference: str | None) -> dict[str, str]:
-    if not reference:
-        return {"dataset": "", "table": "", "column": ""}
-
-    cleaned = reference.strip()
-    column = extract_foreign_column(cleaned)
-    table_part = cleaned.split("(", 1)[0].strip()
-    if "." not in table_part:
-        return {"dataset": "", "table": table_part, "column": column}
-    dataset, table = table_part.split(".", 1)
-    return {"dataset": dataset.strip(), "table": table.strip(), "column": column}
-
-
 def write_terraform_shared_files(terraform_root: Path) -> None:
     variables_tf = terraform_root / "variables.tf"
     variables_tf.write_text(
@@ -220,3 +231,20 @@ def write_terraform_shared_files(terraform_root: Path) -> None:
 
 def build_table_index(tables: list[Table]) -> dict[tuple[str, str], Table]:
     return {(table.dataset_name, table.table_name): table for table in tables}
+
+
+def group_tables_by_layer(tables: list[Table]) -> dict[str, list[Table]]:
+    grouped: dict[str, list[Table]] = {"common": [], "tex": [], "thx": []}
+    for table in tables:
+        grouped.setdefault(table.layer, []).append(table)
+    return grouped
+
+
+def clear_generated_layer_files(root: Path) -> None:
+    for layer in ("common", "tex", "thx"):
+        layer_dir = root / layer
+        if not layer_dir.exists():
+            continue
+        for generated_file in layer_dir.iterdir():
+            if generated_file.is_file():
+                generated_file.unlink()
